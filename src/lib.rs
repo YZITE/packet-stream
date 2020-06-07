@@ -1,10 +1,13 @@
+#![forbid(unsafe_code)]
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_core::{ready, stream::Stream};
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_sink::Sink;
-use pin_utils::pin_mut;
 use std::task::{Context, Poll};
 use std::{fmt, pin::Pin};
+
+#[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 
 pin_project_lite::pin_project! {
@@ -44,7 +47,7 @@ where
 {
     type Item = std::io::Result<Bytes>;
 
-    #[instrument]
+    #[cfg_attr(feature = "tracing", instrument)]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
@@ -66,16 +69,18 @@ where
             // `this` in an invalid state
             // assumption: `read` only yields if it has not read (and dropped) anything yet.
             let mut rdbuf = [0u8; 8192];
-            let stream = &mut this.stream;
-            pin_mut!(stream);
-            match ready!(stream.poll_read(cx, &mut rdbuf)) {
+            match ready!(this.stream.as_mut().poll_read(cx, &mut rdbuf)) {
                 Err(e) => return Poll::Ready(Some(Err(e))),
                 Ok(0) => {
+                    #[cfg(feature = "tracing")]
                     debug!("received EOF");
+
                     return Poll::Ready(None);
                 }
                 Ok(len) => {
+                    #[cfg(feature = "tracing")]
                     debug!("received {} bytes", len);
+
                     this.buf_in.extend_from_slice(&rdbuf[..len]);
                 }
             }
@@ -110,7 +115,7 @@ where
         Ok(())
     }
 
-    #[instrument]
+    #[cfg_attr(feature = "tracing", instrument)]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
         let this = self.project();
         let buf_out = this.buf_out;
@@ -121,7 +126,10 @@ where
             // data two times, and thus invalidating the data stream
             // assumption: `write` only yields if it has not written anything yet
             let len = pollerfwd!(stream.as_mut().poll_write(cx, &buf_out[..]));
+
+            #[cfg(feature = "tracing")]
             debug!("sent {} bytes", len);
+
             // drop written part
             buf_out.advance(len);
         }
