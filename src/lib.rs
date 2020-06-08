@@ -117,23 +117,21 @@ where
 
     #[cfg_attr(feature = "tracing", instrument)]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        let this = self.project();
+        let mut this = self.project();
         let buf_out = this.buf_out;
-        let mut stream = this.stream;
-        // this part is easier... we just need to wait until all data is written
-        while !buf_out.is_empty() {
-            // every call to `write` might yield, and we must be sure to not send
-            // data two times, and thus invalidating the data stream
-            // assumption: `write` only yields if it has not written anything yet
-            let len = pollerfwd!(stream.as_mut().poll_write(cx, &buf_out[..]));
+        let _old_len = buf_out.remaining();
+        let tmp = poll_buf_utils::poll_write(buf_out, this.stream.as_mut(), cx);
 
-            #[cfg(feature = "tracing")]
-            debug!("sent {} bytes", len);
-
-            // drop written part
-            buf_out.advance(len);
+        #[cfg(feature = "tracing")]
+        {
+            let dlen = _old_len - buf_out.remaining();
+            if dlen != 0 {
+                debug!("sent {} bytes", dlen);
+            }
         }
-        stream.poll_flush(cx)
+
+        pollerfwd!(tmp);
+        this.stream.poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {

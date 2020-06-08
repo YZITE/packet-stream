@@ -1,7 +1,7 @@
 [package]
 name = "yz-packet-stream"
 description = "Provides an ordered message-passing Stream/Sink interface on top of almost any AsyncRead+AsyncWrite data stream"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
@@ -13,4 +13,5 @@ futures-core = "0.3"
 futures-io = "0.3"
 futures-sink = "0.3"
 pin-project-lite = "0.1"
+poll-buf-utils = "0.0"
 tracing = { version = "0.1", optional = true }
