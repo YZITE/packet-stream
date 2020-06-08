@@ -72,25 +72,27 @@ where
                 return Poll::Ready(None);
             }
 
-            // we need more data; the `read` might yield,
-            // and it should not leave any part of `this` in an invalid state
-            let tmp = poll_buf_utils::poll_read(this.stream.as_mut(), this.buf_in, cx, usize::from(u16::MAX) + 2);
-            if tmp.delta != 0 {
-                #[cfg(feature = "tracing")]
-                debug!("received {} bytes", tmp.delta);
-            }
-            if let Poll::Ready(Ok(_reached_limit)) = &tmp.ret {
-                #[cfg(feature = "tracing")]
-                debug!("received EOF (reached_limit = {:?})", _reached_limit);
+            // we need more data
+            // the `read` might yield, and it should not leave any part of
+            // `this` in an invalid state
+            // assumption: `read` only yields if it has not read (and dropped) anything yet.
+            let mut rdbuf = [0u8; 8192];
+            match ready!(this.stream.as_mut().poll_read(cx, &mut rdbuf)) {
+                Err(e) => return Poll::Ready(Some(Err(e))),
+                Ok(0) => {
+                    #[cfg(feature = "tracing")]
+                    debug!("received EOF");
 
-                *this.in_got_eof = true;
+                    *this.in_got_eof = true;
+                    return Poll::Ready(None);
+                }
+                Ok(len) => {
+                    #[cfg(feature = "tracing")]
+                    debug!("received {} bytes", len);
+
+                    this.buf_in.extend_from_slice(&rdbuf[..len]);
+                }
             }
-            if tmp.delta == 0 {
-                // yield to the executor
-                return tmp.ret.map(|y| y.err().map(Err));
-            }
-            // we don't yield to the executor, this might lead to spurious wake-ups,
-            // but we don't really care...
         }
     }
 }
