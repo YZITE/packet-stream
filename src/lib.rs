@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures_core::{ready, stream::Stream};
+use futures_core::{ready, stream};
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_sink::Sink;
 use std::task::{Context, Poll};
@@ -17,6 +17,7 @@ pin_project_lite::pin_project! {
         stream: T,
         buf_in: BytesMut,
         buf_out: BytesMut,
+        in_got_eof: bool,
         in_xpdlen: Option<usize>,
     }
 }
@@ -27,6 +28,7 @@ impl<T> PacketStream<T> {
             stream,
             buf_in: BytesMut::new(),
             buf_out: BytesMut::new(),
+            in_got_eof: false,
             in_xpdlen: None,
         }
     }
@@ -41,7 +43,7 @@ macro_rules! pollerfwd {
     }};
 }
 
-impl<T> Stream for PacketStream<T>
+impl<T> stream::Stream for PacketStream<T>
 where
     T: AsyncRead + fmt::Debug,
 {
@@ -53,7 +55,9 @@ where
 
         loop {
             if this.buf_in.len() >= 2 && this.in_xpdlen.is_none() {
-                *this.in_xpdlen = Some(this.buf_in.get_u16().into());
+                let expect_len: usize = this.buf_in.get_u16().into();
+                *this.in_xpdlen = Some(expect_len);
+                this.buf_in.reserve(expect_len);
             }
             if let Some(expect_len) = *this.in_xpdlen {
                 if this.buf_in.len() >= expect_len {
@@ -63,28 +67,40 @@ where
                     return Poll::Ready(Some(Ok(this.buf_in.split_to(expect_len).freeze())));
                 }
             }
-
-            // we need more data
-            // the `read` might yield, and it should not leave any part of
-            // `this` in an invalid state
-            // assumption: `read` only yields if it has not read (and dropped) anything yet.
-            let mut rdbuf = [0u8; 8192];
-            match ready!(this.stream.as_mut().poll_read(cx, &mut rdbuf)) {
-                Err(e) => return Poll::Ready(Some(Err(e))),
-                Ok(0) => {
-                    #[cfg(feature = "tracing")]
-                    debug!("received EOF");
-
-                    return Poll::Ready(None);
-                }
-                Ok(len) => {
-                    #[cfg(feature = "tracing")]
-                    debug!("received {} bytes", len);
-
-                    this.buf_in.extend_from_slice(&rdbuf[..len]);
-                }
+            if *this.in_got_eof {
+                // don't poll again bc we reached EOF
+                return Poll::Ready(None);
             }
+
+            // we need more data; the `read` might yield,
+            // and it should not leave any part of `this` in an invalid state
+            let tmp = poll_buf_utils::poll_read(this.stream.as_mut(), this.buf_in, cx, usize::from(u16::MAX) + 2);
+            if tmp.delta != 0 {
+                #[cfg(feature = "tracing")]
+                debug!("received {} bytes", tmp.delta);
+            }
+            if let Poll::Ready(Ok(_reached_limit)) = &tmp.ret {
+                #[cfg(feature = "tracing")]
+                debug!("received EOF (reached_limit = {:?})", _reached_limit);
+
+                *this.in_got_eof = true;
+            }
+            if tmp.delta == 0 {
+                // yield to the executor
+                return tmp.ret.map(|y| y.err().map(Err));
+            }
+            // we don't yield to the executor, this might lead to spurious wake-ups,
+            // but we don't really care...
         }
+    }
+}
+
+impl<T> stream::FusedStream for PacketStream<T>
+where
+    T: AsyncRead + fmt::Debug,
+{
+    fn is_terminated(&self) -> bool {
+        self.in_got_eof && self.buf_in.len() < self.in_xpdlen.unwrap_or(2)
     }
 }
 
@@ -118,19 +134,14 @@ where
     #[cfg_attr(feature = "tracing", instrument)]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
         let mut this = self.project();
-        let buf_out = this.buf_out;
-        let _old_len = buf_out.remaining();
-        let tmp = poll_buf_utils::poll_write(buf_out, this.stream.as_mut(), cx);
+        let tmp = poll_buf_utils::poll_write(this.buf_out, this.stream.as_mut(), cx);
 
         #[cfg(feature = "tracing")]
-        {
-            let dlen = _old_len - buf_out.remaining();
-            if dlen != 0 {
-                debug!("sent {} bytes", dlen);
-            }
+        if tmp.delta != 0 {
+            debug!("sent {} bytes", tmp.delta);
         }
 
-        pollerfwd!(tmp);
+        pollerfwd!(tmp.ret);
         this.stream.poll_flush(cx)
     }
 
