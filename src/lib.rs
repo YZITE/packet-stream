@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_core::{ready, stream};
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_sink::Sink;
 use std::task::{Context, Poll};
 use std::{fmt, pin::Pin};
 
@@ -15,8 +13,8 @@ pin_project_lite::pin_project! {
     pub struct PacketStream<T> {
         #[pin]
         stream: T,
-        buf_in: BytesMut,
-        buf_out: BytesMut,
+        buf_in: Vec<u8>,
+        buf_out: Vec<u8>,
         in_got_eof: bool,
         in_xpdlen: Option<usize>,
     }
@@ -26,8 +24,8 @@ impl<T> PacketStream<T> {
     pub fn new(stream: T) -> Self {
         Self {
             stream,
-            buf_in: BytesMut::new(),
-            buf_out: BytesMut::new(),
+            buf_in: Vec::new(),
+            buf_out: Vec::new(),
             in_got_eof: false,
             in_xpdlen: None,
         }
@@ -47,7 +45,7 @@ impl<T> stream::Stream for PacketStream<T>
 where
     T: AsyncRead + fmt::Debug,
 {
-    type Item = std::io::Result<Bytes>;
+    type Item = std::io::Result<Vec<u8>>;
 
     #[cfg_attr(feature = "tracing", instrument)]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -55,16 +53,22 @@ where
 
         loop {
             if this.buf_in.len() >= 2 && this.in_xpdlen.is_none() {
-                let expect_len: usize = this.buf_in.get_u16().into();
+                let mut tmp = [0u8; 2usize];
+                tmp.copy_from_slice(&this.buf_in[..2]);
+                let _ = this.buf_in.drain(..2);
+                let expect_len: usize = u16::from_be_bytes(tmp).into();
                 *this.in_xpdlen = Some(expect_len);
-                this.buf_in.reserve(expect_len);
+                if expect_len > this.buf_in.capacity() {
+                    this.buf_in.reserve(expect_len - this.buf_in.len());
+                }
             }
             if let Some(expect_len) = *this.in_xpdlen {
                 if this.buf_in.len() >= expect_len {
                     // we are done, if we reach this,
                     // the length spec was already removed from buf_xin
                     *this.in_xpdlen = None;
-                    return Poll::Ready(Some(Ok(this.buf_in.split_to(expect_len).freeze())));
+                    let new_buf_in = this.buf_in.split_off(expect_len);
+                    return Poll::Ready(Some(Ok(std::mem::replace(this.buf_in, new_buf_in))));
                 }
             }
             if *this.in_got_eof {
@@ -101,6 +105,7 @@ impl<T> stream::FusedStream for PacketStream<T>
 where
     T: AsyncRead + fmt::Debug,
 {
+    #[inline]
     fn is_terminated(&self) -> bool {
         self.in_got_eof && self.buf_in.len() < self.in_xpdlen.unwrap_or(2)
     }
@@ -108,47 +113,56 @@ where
 
 type SinkYield = Poll<Result<(), std::io::Error>>;
 
-impl<B, T> Sink<B> for PacketStream<T>
+impl<T> PacketStream<T>
 where
-    B: AsRef<[u8]>,
     T: AsyncWrite + fmt::Debug,
 {
-    type Error = std::io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        if self.buf_out.len() > u16::MAX.into() {
-            pollerfwd!(Sink::<B>::poll_flush(self, cx));
-        }
-        Poll::Ready(Ok(()))
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: B) -> Result<(), std::io::Error> {
+    fn enqueue_intern(self: Pin<&mut Self>, item: &[u8]) -> Result<(), std::io::Error> {
         use std::convert::TryInto;
         let buf_out = self.project().buf_out;
-        let item = item.as_ref();
-        buf_out.put_u16(item.len().try_into().map_err(|_| {
+        buf_out.extend_from_slice(&u16::to_be_bytes(item.len().try_into().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "length overflow")
-        })?);
+        })?));
         buf_out.extend_from_slice(item);
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracing", instrument)]
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        let mut this = self.project();
-        let tmp = poll_buf_utils::poll_write(this.buf_out, this.stream.as_mut(), cx);
-
-        #[cfg(feature = "tracing")]
-        if tmp.delta != 0 {
-            debug!("sent {} bytes", tmp.delta);
-        }
-
-        pollerfwd!(tmp.ret);
-        this.stream.poll_flush(cx)
+    /// generic sending method
+    #[inline]
+    pub fn enqueue<B: AsRef<[u8]>>(self: Pin<&mut Self>, item: B) -> Result<(), std::io::Error> {
+        self.enqueue_intern(item.as_ref())
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        pollerfwd!(Sink::<B>::poll_flush(self.as_mut(), cx));
+    #[cfg_attr(feature = "tracing", instrument)]
+    pub fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
+        let this = self.project();
+        let (buf_out, mut stream) = (this.buf_out, this.stream);
+        let mut offset = 0;
+
+        let ret = loop {
+            match stream.as_mut().poll_write(cx, &buf_out[offset..]) {
+                // if we managed to write something...
+                Poll::Ready(Ok(n)) if n != 0 => offset += n,
+
+                // assumption: if we get here, the call to poll_write failed and
+                // didn't write anything
+                ret => break ret,
+            }
+        };
+
+        if offset != 0 {
+            let _ = buf_out.drain(..offset);
+
+            #[cfg(feature = "tracing")]
+            debug!("sent {} bytes", offset);
+        }
+
+        pollerfwd!(ret);
+        stream.poll_flush(cx)
+    }
+
+    pub fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
+        pollerfwd!(self.as_mut().poll_flush(cx));
         self.project().stream.poll_close(cx)
     }
 }
