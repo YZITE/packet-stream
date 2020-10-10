@@ -157,3 +157,10 @@ where
         self.project().stream.poll_close(cx)
     }
 }
+
+impl<T> PacketStream<T> {
+    #[inline(always)]
+    pub fn get_ref(&self) -> &T {
+        &self.stream
+    }
+}

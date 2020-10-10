@@ -1,7 +1,7 @@
 [package]
 name = "yz-packet-stream"
 description = "Provides an ordered message-passing Stream+custom Sink interface on top of almost any AsyncRead+AsyncWrite data stream"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
