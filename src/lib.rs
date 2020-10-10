@@ -32,15 +32,6 @@ impl<T> PacketStream<T> {
     }
 }
 
-macro_rules! pollerfwd {
-    ($x:expr) => {{
-        match ready!($x) {
-            Ok(x) => x,
-            Err(e) => return ::std::task::Poll::Ready(Err(e)),
-        }
-    }};
-}
-
 impl<T> stream::Stream for PacketStream<T>
 where
     T: AsyncRead + fmt::Debug,
@@ -157,12 +148,12 @@ where
             debug!("sent {} bytes", offset);
         }
 
-        pollerfwd!(ret);
+        ready!(ret?);
         stream.poll_flush(cx)
     }
 
     pub fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        pollerfwd!(self.as_mut().poll_flush(cx));
+        ready!(self.as_mut().poll_flush(cx)?);
         self.project().stream.poll_close(cx)
     }
 }
